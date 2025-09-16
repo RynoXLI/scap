@@ -1,13 +1,47 @@
 // This program is just a testing application
 // Refer to `lib.rs` for the library source code
 
+use futures::stream::iter;
 use scap::{
     capturer::{Area, Capturer, Options, Point, Size},
     frame::{Frame, VideoFrame},
+    get_all_targets, Target,
 };
 use std::process;
 
 fn main() {
+    // print out all targets
+    let targets = get_all_targets();
+    for target in targets {
+        match target {
+            Target::Display(display) => {
+                println!("Found display target: {:?}", display);
+            }
+            Target::Window(window) => {
+                println!("Found window target: {:?}", window);
+            }
+        }
+    }
+
+    let selected_id = std::io::stdin()
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let new_targets = get_all_targets();
+    let selected_target: Target = new_targets
+        .into_iter()
+        .find(|target| match target {
+            Target::Display(_) => false,
+            Target::Window(window) => window.id == selected_id,
+        })
+        .expect("Couldn't find the target");
+
+    println!("Selected Target {:?}", selected_target);
+
     // Check if the platform is supported
     if !scap::is_supported() {
         println!("❌ Platform not supported");
@@ -35,13 +69,8 @@ fn main() {
         excluded_targets: None,
         output_type: scap::frame::FrameType::BGRAFrame,
         output_resolution: scap::capturer::Resolution::_720p,
-        crop_area: Some(Area {
-            origin: Point { x: 0.0, y: 0.0 },
-            size: Size {
-                width: 500.0,
-                height: 500.0,
-            },
-        }),
+        crop_area: None,
+        target: Some(selected_target),
         captures_audio: true,
         ..Default::default()
     };
@@ -62,7 +91,7 @@ fn main() {
                 Frame::Video(frame) => {
                     break frame;
                 }
-                Frame::Audio(_) => {
+                Frame::Audio(frame) => {
                     continue;
                 }
             }
