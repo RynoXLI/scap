@@ -1,19 +1,19 @@
 use crate::{
     capturer::{Area, Options, Point, Resolution, Size},
     frame::{AudioFormat, AudioFrame, BGRAFrame, Frame, FrameType, VideoFrame},
-    targets::{self, get_scale_factor, Target},
+    targets::{self, Target},
 };
+use ::windows::Win32::Foundation::HWND;
 use ::windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use cpal::{
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-    StreamInstant,
-};
+use ::windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp, time::Duration};
-use std::{
-    os::windows,
-    ptr::null_mut,
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
+use wasapi::{
+    initialize_mta, AudioCaptureClient, AudioClient, Direction, Handle, SampleType, StreamMode,
+    WasapiError, WaveFormat,
 };
 use windows_capture::{
     capture::{CaptureControl, Context, GraphicsCaptureApiHandler},
@@ -76,7 +76,7 @@ impl GraphicsCaptureApiHandler for Capturer {
         frame: &mut WCFrame,
         _: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        let elapsed = frame.timespan().Duration - self.start_time.0;
+        let elapsed = frame.timestamp().Duration - self.start_time.0;
         let display_time = self
             .start_time
             .1
@@ -123,6 +123,7 @@ impl GraphicsCaptureApiHandler for Capturer {
                 let mut frame_buffer = frame.buffer().unwrap();
                 let raw_frame_buffer = frame_buffer.as_raw_buffer();
                 let frame_data = raw_frame_buffer.to_vec();
+                println!("Frame dimensions: {}x{}", frame.width(), frame.height());
                 let current_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .expect("Failed to get current time")
@@ -180,6 +181,7 @@ struct FlagStruct {
 pub enum CreateCapturerError {
     AudioStreamConfig(cpal::DefaultStreamConfigError),
     BuildAudioStream(cpal::BuildStreamError),
+    BuildAudioClient(wasapi::WasapiError),
 }
 
 pub fn create_capturer(
@@ -224,26 +226,53 @@ pub fn create_capturer(
                 crop: Some(get_crop_area(options)),
             },
         )),
-        Target::Window(window) => Settings::Window(WCSettings::new(
-            WCWindow::from_raw_hwnd(window.raw_handle.0),
-            show_cursor,
-            draw_border,
-            SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Default,
-            DirtyRegionSettings::Default,
-            color_format,
-            FlagStruct {
-                tx: tx.clone(),
-                crop: Some(get_crop_area(options)),
-            },
-        )),
+        Target::Window(window) => {
+            if options.crop_area.is_some() {
+                Settings::Window(WCSettings::new(
+                    WCWindow::from_raw_hwnd(window.raw_handle.0),
+                    show_cursor,
+                    draw_border,
+                    SecondaryWindowSettings::Default,
+                    MinimumUpdateIntervalSettings::Default,
+                    DirtyRegionSettings::Default,
+                    color_format,
+                    FlagStruct {
+                        tx: tx.clone(),
+                        crop: Some(get_crop_area(options)),
+                    },
+                ))
+            } else {
+                Settings::Window(WCSettings::new(
+                    WCWindow::from_raw_hwnd(window.raw_handle.0),
+                    show_cursor,
+                    draw_border,
+                    SecondaryWindowSettings::Default,
+                    MinimumUpdateIntervalSettings::Default,
+                    DirtyRegionSettings::Default,
+                    color_format,
+                    FlagStruct {
+                        tx: tx.clone(),
+                        crop: None,
+                    },
+                ))
+            }
+        }
     };
 
     let audio_stream = if options.captures_audio {
         let (ctrl_tx, ctrl_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
 
-        spawn_audio_stream(tx.clone(), ready_tx, ctrl_rx);
+        if let Some(target) = &options.target {
+            match target {
+                Target::Display(_) => {
+                    spawn_audio_stream(tx.clone(), ready_tx, ctrl_rx);
+                }
+                Target::Window(window) => {
+                    spawn_app_audio_stream(tx.clone(), ready_tx, ctrl_rx, &window.raw_handle);
+                }
+            }
+        }
 
         match ready_rx.recv() {
             Ok(Ok(())) => {}
@@ -450,4 +479,248 @@ fn spawn_audio_stream(
             };
         }
     });
+}
+
+fn get_window_process_id(hwnd: &HWND) -> u32 {
+    let mut processid: u32 = 0;
+    unsafe {
+        // thread id sent back too, but we don't need it.
+        let _ = GetWindowThreadProcessId(*hwnd, Some(&mut processid));
+    }
+    processid
+}
+
+fn get_default_output_config(
+    host: &cpal::Host,
+) -> Result<cpal::SupportedStreamConfig, CreateCapturerError> {
+    let default_output_device =
+        host.default_output_device()
+            .ok_or(CreateCapturerError::AudioStreamConfig(
+                cpal::DefaultStreamConfigError::DeviceNotAvailable,
+            ))?;
+    let default_config = default_output_device
+        .default_output_config()
+        .map_err(CreateCapturerError::AudioStreamConfig)?;
+    Ok(default_config)
+}
+
+struct ProcessAudioCapture {
+    sample_count: usize,
+    audio_format: AudioFormat,
+    audio_client: AudioClient,
+    capture_client: AudioCaptureClient,
+    h_event: Handle,
+    channels: usize,
+}
+
+impl ProcessAudioCapture {
+    fn build(
+        process_id: u32,
+        include_tree: bool,
+        sample_count: usize,
+        audio_config: cpal::SupportedStreamConfig,
+    ) -> Result<Self, CreateCapturerError> {
+        initialize_mta().ok().map_err(|_| {
+            CreateCapturerError::BuildAudioClient(wasapi::WasapiError::ClientNotInit)
+        })?;
+        let audio_format = audio_config.sample_format().into();
+
+        let samplerate = audio_config.sample_rate().0 as usize;
+        let channels = audio_config.channels() as usize;
+
+        let desired_format = match audio_format {
+            AudioFormat::U8 => WaveFormat::new(8, 8, &SampleType::Int, samplerate, channels, None),
+            AudioFormat::I16 => {
+                WaveFormat::new(16, 16, &SampleType::Int, samplerate, channels, None)
+            }
+            AudioFormat::I32 => {
+                WaveFormat::new(32, 32, &SampleType::Int, samplerate, channels, None)
+            }
+            AudioFormat::F32 => {
+                WaveFormat::new(32, 32, &SampleType::Float, samplerate, channels, None)
+            }
+            _ => {
+                return Err(CreateCapturerError::BuildAudioClient(
+                    wasapi::WasapiError::UnsupportedFormat,
+                ))
+            }
+        };
+        let autoconvert = true;
+
+        let mut audio_client =
+            AudioClient::new_application_loopback_client(process_id, include_tree)
+                .map_err(CreateCapturerError::BuildAudioClient)?;
+        let mode = StreamMode::EventsShared {
+            autoconvert,
+            buffer_duration_hns: 0,
+        };
+        audio_client
+            .initialize_client(&desired_format, &Direction::Capture, &mode)
+            .map_err(CreateCapturerError::BuildAudioClient)?;
+
+        let h_event = audio_client.set_get_eventhandle().unwrap();
+
+        let capture_client = audio_client.get_audiocaptureclient().unwrap();
+
+        Ok(Self {
+            sample_count,
+            audio_format,
+            audio_client,
+            capture_client,
+            h_event,
+            channels,
+        })
+    }
+
+    fn start<F>(&self, on_chunk: F, stop_rx: Receiver<()>)
+    where
+        F: Fn(Vec<u8>, &wasapi::BufferInfo),
+    {
+        self.audio_client.start_stream().unwrap();
+        let mut sample_queue: VecDeque<u8> = VecDeque::new();
+
+        loop {
+            // Check for stop signal (non-blocking)
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            let new_frames = match self.capture_client.get_next_packet_size() {
+                Ok(frames) => frames.unwrap_or(0),
+                Err(e) => {
+                    println!("Error getting packet size: {}, stopping capture", e);
+                    break;
+                }
+            };
+            let additional = (new_frames as usize * self.audio_format.sample_size())
+                .saturating_sub(sample_queue.capacity() - sample_queue.len());
+            sample_queue.reserve(additional); // reserve any additional space needed
+
+            if new_frames > 0 {
+                let buffer_info = match self
+                    .capture_client
+                    .read_from_device_to_deque(&mut sample_queue)
+                {
+                    Ok(info) => info,
+                    Err(e) => {
+                        println!("Error reading from device: {}, stopping capture", e);
+                        break;
+                    }
+                };
+
+                // Calculate chunk size in bytes: samples * channels * sample_size
+                let chunk_size_bytes =
+                    self.sample_count * self.channels * self.audio_format.sample_size();
+
+                // Process chunks immediately after getting new data
+                while sample_queue.len() >= chunk_size_bytes {
+                    let mut chunk = vec![0u8; chunk_size_bytes];
+                    for element in chunk.iter_mut() {
+                        *element = sample_queue.pop_front().unwrap();
+                    }
+
+                    on_chunk(chunk, &buffer_info);
+                }
+            }
+
+            match self.h_event.wait_for_event(100) {
+                Ok(_) => {
+                    // Event signaled, continue to check for new frames
+                }
+                Err(WasapiError::EventTimeout) => {
+                    continue;
+                }
+                Err(e) => {
+                    println!("Error waiting for event: {}, stopping capture", e);
+                    break;
+                }
+            }
+        }
+
+        self.audio_client.stop_stream().unwrap();
+    }
+}
+
+fn spawn_app_audio_stream(
+    tx: Sender<Frame>,
+    ready_tx: Sender<Result<(), CreateCapturerError>>,
+    ctrl_rx: Receiver<AudioStreamControl>,
+    window_handle: &HWND,
+) {
+    let process_id = get_window_process_id(&window_handle);
+    let include_tree = true;
+    let buffer_ms = 10.0; // Buffer duration in milliseconds, windows is always set to 10ms
+
+    let audio_config = get_default_output_config(&cpal::default_host()).unwrap();
+    let sample_count = (audio_config.sample_rate().0 as f64 * (buffer_ms / 1000.0)) as usize;
+    let audio_format: AudioFormat = audio_config.sample_format().into();
+    let samplerate = audio_config.sample_rate().0 as u32;
+    let channels = audio_config.channels() as u16;
+
+    let _handle = std::thread::Builder::new()
+        .name("AudioCapture".to_string())
+        .spawn(move || {
+            // Create COM objects INSIDE the thread where they'll be used
+            let res =
+                ProcessAudioCapture::build(process_id, include_tree, sample_count, audio_config);
+
+            let audio_capture = match res {
+                Ok(capture) => {
+                    let _ = ready_tx.send(Ok(()));
+                    capture
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            // Wait for start command
+            match ctrl_rx.recv() {
+                Ok(AudioStreamControl::Start) => {
+                    // Create a channel for stopping the audio capture loop
+                    let (stop_tx, stop_rx) = mpsc::channel();
+
+                    // Start audio capture with direct frame creation
+                    audio_capture.start(
+                        move |chunk, _buffer_info| {
+                            let system_timestamp = SystemTime::now();
+                            let frame = AudioFrame::new(
+                                audio_format,
+                                channels as u16,
+                                false,
+                                chunk,
+                                sample_count,
+                                samplerate,
+                                system_timestamp,
+                            );
+
+                            // Send frame directly, if it fails the receiver is gone
+                            if tx.send(Frame::Audio(frame)).is_err() {
+                                return;
+                            }
+                        },
+                        stop_rx,
+                    );
+
+                    // Listen for stop commands in the main control channel
+                    loop {
+                        match ctrl_rx.recv() {
+                            Ok(AudioStreamControl::Stop) => {
+                                let _ = stop_tx.send(());
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = stop_tx.send(());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(AudioStreamControl::Stop) | Err(_) => {
+                    return;
+                }
+            }
+        });
 }
